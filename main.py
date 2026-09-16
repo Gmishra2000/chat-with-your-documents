@@ -6,8 +6,9 @@ from typing import List
 import chromadb
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from langchain.chains import RetrievalQA
 from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.retrievers import BaseRetriever
 from langchain_openai import ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -50,15 +51,47 @@ class ChromaRetriever(BaseRetriever):
 
 retriever = ChromaRetriever()
 
-# temperature=0 makes answers deterministic/focused rather than creative --
-# appropriate for "answer from this context", not creative writing.
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    retriever=retriever,
-    return_source_documents=True,
+# ChatPromptTemplate.from_template() is a plain string with {placeholders} --
+# LangChain fills them in from a dict when the chain runs, the same idea as an
+# f-string but deferred until invoke() time instead of built immediately.
+# This part needs no API key, so it's safe to build at import time.
+prompt = ChatPromptTemplate.from_template(
+    "Use the following context to answer the question. "
+    "If the answer isn't in the context, say you don't know.\n\n"
+    "Context:\n{context}\n\n"
+    "Question: {question}\n\n"
+    "Answer:"
 )
+
+_answer_chain = None
+
+
+def get_answer_chain():
+    """Builds the LLM + chain on first use, not at import time.
+
+    ChatOpenAI's constructor eagerly creates OpenAI's real client, which
+    validates credentials immediately and raises if no API key is present.
+    Building it at module level would crash the *entire app* on startup
+    whenever no key is configured -- including routes that have nothing to
+    do with OpenAI. Building it lazily, only after /ask has already
+    confirmed a key exists, keeps every other route working regardless.
+    Cached in _answer_chain after the first call, same "build once" instinct
+    as embedding_model and chroma_client above.
+    """
+    global _answer_chain
+    if _answer_chain is None:
+        # temperature=0 makes answers deterministic/focused rather than
+        # creative -- appropriate for "answer from this context".
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        # This is the LCEL pipe replacing RetrievalQA: prompt's filled-in text
+        # goes into llm, llm's raw response object goes into StrOutputParser,
+        # which pulls out the plain answer string.
+        _answer_chain = prompt | llm | StrOutputParser()
+    return _answer_chain
+
+
+def format_docs(docs: List[Document]) -> str:
+    return "\n\n".join(doc.page_content for doc in docs)
 
 
 @app.get("/")
@@ -120,17 +153,20 @@ async def ask_question(payload: AskRequest):
         )
 
     # .ainvoke(), not .invoke() -- same reasoning as await file.read() earlier:
-    # this call waits on a network request to OpenAI, so we free up the event
-    # loop to handle other requests while waiting, instead of blocking on it.
-    result = await qa_chain.ainvoke({"query": payload.question})
+    # both calls wait on I/O (a network request, here to Chroma then OpenAI), so
+    # we free up the event loop to handle other requests while waiting.
+    docs = await retriever.ainvoke(payload.question)
+    answer = await get_answer_chain().ainvoke(
+        {"context": format_docs(docs), "question": payload.question}
+    )
 
     sources = [
         {"filename": doc.metadata.get("filename"), "chunk_index": doc.metadata.get("chunk_index")}
-        for doc in result["source_documents"]
+        for doc in docs
     ]
 
     return {
         "question": payload.question,
-        "answer": result["result"],
+        "answer": answer,
         "sources": sources,
     }
