@@ -10,7 +10,7 @@ from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.retrievers import BaseRetriever
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
 from pypdf import PdfReader
@@ -18,7 +18,7 @@ from sentence_transformers import SentenceTransformer
 
 # python-dotenv reads a local .env file and copies its values into the process's
 # environment variables — same job as the `dotenv` npm package. We use it so the
-# OpenAI API key lives in a gitignored file on disk, never hardcoded or committed.
+# Gemini API key lives in a gitignored file on disk, never hardcoded or committed.
 load_dotenv()
 
 app = FastAPI()
@@ -69,20 +69,21 @@ _answer_chain = None
 def get_answer_chain():
     """Builds the LLM + chain on first use, not at import time.
 
-    ChatOpenAI's constructor eagerly creates OpenAI's real client, which
-    validates credentials immediately and raises if no API key is present.
-    Building it at module level would crash the *entire app* on startup
-    whenever no key is configured -- including routes that have nothing to
-    do with OpenAI. Building it lazily, only after /ask has already
-    confirmed a key exists, keeps every other route working regardless.
-    Cached in _answer_chain after the first call, same "build once" instinct
-    as embedding_model and chroma_client above.
+    ChatGoogleGenerativeAI's constructor eagerly validates credentials
+    immediately and raises if no API key is present (verified this behaves
+    the same way ChatOpenAI did before writing this). Building it at module
+    level would crash the *entire app* on startup whenever no key is
+    configured -- including routes that have nothing to do with Gemini.
+    Building it lazily, only after /ask has already confirmed a key exists,
+    keeps every other route working regardless. Cached in _answer_chain
+    after the first call, same "build once" instinct as embedding_model and
+    chroma_client above.
     """
     global _answer_chain
     if _answer_chain is None:
         # temperature=0 makes answers deterministic/focused rather than
         # creative -- appropriate for "answer from this context".
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0)
         # This is the LCEL pipe replacing RetrievalQA: prompt's filled-in text
         # goes into llm, llm's raw response object goes into StrOutputParser,
         # which pulls out the plain answer string.
@@ -146,14 +147,14 @@ class AskRequest(BaseModel):
 
 @app.post("/ask")
 async def ask_question(payload: AskRequest):
-    if not os.environ.get("OPENAI_API_KEY"):
+    if not os.environ.get("GOOGLE_API_KEY"):
         raise HTTPException(
             status_code=500,
-            detail="OPENAI_API_KEY is not set. Add it to a .env file in backend/.",
+            detail="GOOGLE_API_KEY is not set. Add it to a .env file in backend/.",
         )
 
     # .ainvoke(), not .invoke() -- same reasoning as await file.read() earlier:
-    # both calls wait on I/O (a network request, here to Chroma then OpenAI), so
+    # both calls wait on I/O (a network request, here to Chroma then Gemini), so
     # we free up the event loop to handle other requests while waiting.
     docs = await retriever.ainvoke(payload.question)
     answer = await get_answer_chain().ainvoke(
