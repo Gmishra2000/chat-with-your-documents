@@ -7,6 +7,14 @@ import chromadb
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from langchain_core.documents import Document
+from langchain_core.exceptions import (
+    ContextOverflowError,
+    ModelAPIError,
+    ModelAuthenticationError,
+    ModelNotFoundError,
+    ModelPermissionDeniedError,
+    ModelRateLimitError,
+)
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.retrievers import BaseRetriever
@@ -26,6 +34,7 @@ app = FastAPI()
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 TOP_K = 4
+GEMINI_MODEL = "gemini-3.6-flash"
 
 # Loaded once at startup, not inside the route — loading model weights or opening
 # a database connection per-request would repeat that cost on every single upload.
@@ -83,7 +92,7 @@ def get_answer_chain():
     if _answer_chain is None:
         # temperature=0 makes answers deterministic/focused rather than
         # creative -- appropriate for "answer from this context".
-        llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0)
+        llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0)
         # This is the LCEL pipe replacing RetrievalQA: prompt's filled-in text
         # goes into llm, llm's raw response object goes into StrOutputParser,
         # which pulls out the plain answer string.
@@ -157,9 +166,51 @@ async def ask_question(payload: AskRequest):
     # both calls wait on I/O (a network request, here to Chroma then Gemini), so
     # we free up the event loop to handle other requests while waiting.
     docs = await retriever.ainvoke(payload.question)
-    answer = await get_answer_chain().ainvoke(
-        {"context": format_docs(docs), "question": payload.question}
-    )
+
+    # langchain_google_genai classifies every raw Gemini error into one of
+    # langchain_core's standardized exception types below -- not Gemini-specific
+    # ones. That's deliberate: if we ever swap providers again, this except
+    # block keeps working unchanged, same as the rest of the LCEL chain did.
+    # Without this, any of these would surface to the caller as a bare,
+    # unhelpful "500 Internal Server Error" -- exactly what happened before.
+    try:
+        answer = await get_answer_chain().ainvoke(
+            {"context": format_docs(docs), "question": payload.question}
+        )
+    except ModelAuthenticationError as e:
+        raise HTTPException(
+            status_code=500,
+            detail="Gemini rejected the API key. Check GOOGLE_API_KEY in backend/.env.",
+        ) from e
+    except ModelPermissionDeniedError as e:
+        raise HTTPException(
+            status_code=500,
+            detail="This API key doesn't have permission to use this model.",
+        ) from e
+    except ModelNotFoundError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Model '{GEMINI_MODEL}' wasn't found -- it may have been "
+                "renamed or retired. Check https://ai.google.dev/gemini-api/docs/models "
+                "for current model names."
+            ),
+        ) from e
+    except ModelRateLimitError as e:
+        raise HTTPException(
+            status_code=429,
+            detail="Gemini rate limit or quota exceeded. Wait a bit and try again.",
+        ) from e
+    except ContextOverflowError as e:
+        raise HTTPException(
+            status_code=400,
+            detail="The question plus retrieved context was too long for the model. Try a shorter question.",
+        ) from e
+    except ModelAPIError as e:
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini's API failed unexpectedly. Try again shortly.",
+        ) from e
 
     sources = [
         {"filename": doc.metadata.get("filename"), "chunk_index": doc.metadata.get("chunk_index")}
